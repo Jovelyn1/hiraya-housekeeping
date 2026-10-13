@@ -1,0 +1,114 @@
+// HOUSEKEEPING ADDITIONS FOR FIRESTORE RULES
+//
+// Do NOT replace your existing rules with this file. The booking site and the Hub depend on them.
+// Open Firebase console > Firestore Database > Rules, then paste the helper functions and the
+// match blocks below INSIDE your existing:  match /databases/{database}/documents { ... }
+//
+// Firestore allows a request when ANY matching rule allows it, so these blocks ADD housekeeping
+// access without removing what the booking site or the Hub already have. The helper functions
+// are named hk... so they never clash with the Hub's isStaff() / isAdmin().
+//
+// Roles used: housekeeping (cleaners), admin, frontdesk (read only). A housekeeping account is a
+// supervisor when its staff document has  supervisor: true. Admins are always supervisors.
+
+function hkProfile() {
+  return get(/databases/$(database)/documents/staff/$(request.auth.uid)).data;
+}
+
+function hkSignedIn() {
+  return request.auth != null
+    && exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+    && hkProfile().active == true;
+}
+
+function isHkStaff() {
+  return hkSignedIn() && hkProfile().role in ['housekeeping', 'admin'];
+}
+
+function isHkAdmin() {
+  return hkSignedIn() && hkProfile().role == 'admin';
+}
+
+function isHkSupervisor() {
+  return isHkAdmin() || (isHkStaff() && hkProfile().get('supervisor', false) == true);
+}
+
+function isFrontdesk() {
+  return hkSignedIn() && hkProfile().role in ['frontdesk', 'admin'];
+}
+
+// ---- Staff: everyone can read their own profile; supervisors can list housekeeping staff ----
+match /staff/{uid} {
+  allow read: if request.auth != null && request.auth.uid == uid;
+  allow read: if isHkSupervisor() && resource.data.role == 'housekeeping';
+  // Only admins change the supervisor flag
+  allow update: if isHkAdmin()
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['supervisor']);
+}
+
+// ---- Tasks: the work itself ----
+match /housekeepingTasks/{taskId} {
+  allow read: if isHkStaff() || isFrontdesk();
+
+  // The Hub (frontdesk) may add requests such as a guest request or a check-out clean
+  allow create: if (isHkStaff() || isFrontdesk())
+    && request.resource.data.createdBy == request.auth.uid
+    && request.resource.data.status == 'open';
+
+  // Supervisors can change anything. A cleaner can only work on a task that is free or theirs,
+  // and only touch the fields a cleaner needs.
+  allow update: if isHkSupervisor()
+    || (isHkStaff()
+        && (resource.data.assignedTo == null || resource.data.assignedTo == request.auth.uid)
+        && (request.resource.data.assignedTo == null || request.resource.data.assignedTo == request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+             'status', 'assignedTo', 'assignedToName', 'claimedAt', 'startedAt', 'doneAt',
+             'durationMin', 'checklist', 'note', 'inspectedAt', 'inspectedBy'
+           ]));
+
+  allow delete: if false;
+}
+
+// ---- Rooms: housekeeping may change ONLY the cleaning fields ----
+match /rooms/{roomId} {
+  allow read: if isHkStaff() || isFrontdesk();
+  allow update: if isHkStaff()
+    && request.resource.data.diff(resource.data).affectedKeys()
+         .hasOnly(['cleaningStatus', 'cleaningUpdatedAt', 'cleaningUpdatedBy']);
+}
+
+// ---- Bookings: supervisors READ ONLY (next arrivals, check-out sync). Cleaners cannot read. ----
+match /bookings/{bookingId} {
+  allow read: if isHkSupervisor();
+}
+
+// ---- Shared activity log: every app appends, supervisors and front desk read ----
+match /activityLog/{logId} {
+  allow read: if isHkSupervisor() || isFrontdesk();
+  allow create: if isHkStaff()
+    && request.resource.data.app == 'housekeeping'
+    && request.resource.data.staffId == request.auth.uid;
+}
+
+// ---- Lost and found ----
+match /lostFound/{itemId} {
+  allow read: if isHkStaff() || isFrontdesk();
+  allow create, update: if isHkStaff();
+  allow delete: if false;
+}
+
+// ---- Supplies ----
+match /supplies/{itemId} {
+  allow read: if isHkStaff();
+  allow create: if isHkSupervisor();
+  allow update: if isHkSupervisor()
+    || (isHkStaff()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stock', 'updatedAt', 'updatedBy']));
+  allow delete: if false;
+}
+
+// ---- App settings (inspection on or off) ----
+match /settings/housekeeping {
+  allow read: if isHkStaff();
+  allow write: if isHkAdmin();
+}
